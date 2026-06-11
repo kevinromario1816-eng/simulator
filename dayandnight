@@ -1,0 +1,337 @@
+local Lighting = game:GetService("Lighting")
+local Terrain = workspace:FindFirstChild("Terrain")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- ============================================
+-- CONFIGURACIÓN DEL CICLO DÍA/NOCHE
+-- ============================================
+local CYCLE_DURATION = 1200 -- segundos para un ciclo completo
+local HOURS_PER_SECOND = 24 / CYCLE_DURATION
+
+-- Configuración de iluminación para día y noche
+local DAY_BRIGHTNESS = 2
+local NIGHT_BRIGHTNESS = 0.2
+
+local DAY_AMBIENT = Color3.fromRGB(128, 128, 128)
+local NIGHT_AMBIENT = Color3.fromRGB(30, 30, 50)
+
+local DAY_OUTDOOR_AMBIENT = Color3.fromRGB(128, 128, 128)
+local NIGHT_OUTDOOR_AMBIENT = Color3.fromRGB(30, 30, 50)
+
+local DAY_FOG_COLOR = Color3.fromRGB(192, 192, 192)
+local NIGHT_FOG_COLOR = Color3.fromRGB(15, 15, 30)
+
+local DAY_COLOR_SHIFT_TOP = Color3.fromRGB(215, 210, 200)
+local NIGHT_COLOR_SHIFT_TOP = Color3.fromRGB(30, 40, 80)
+
+local DAY_COLOR_SHIFT_BOTTOM = Color3.fromRGB(170, 160, 140)
+local NIGHT_COLOR_SHIFT_BOTTOM = Color3.fromRGB(10, 10, 20)
+
+-- ============================================
+-- BASE DE DATOS DE EVENTOS NOCTURNOS
+-- ============================================
+-- Para agregar un nuevo evento, copia uno existente y cambia los valores.
+-- La suma de probabilidades no debe superar 1.0
+-- (el porcentaje restante = noche normal sin evento).
+-- El multiplicador es accesible desde ReplicatedStorage.NightEvents.Multiplier
+
+local NIGHT_EVENTS = {
+	{
+		name = "Luna Roja",
+		probability = 0.30,   -- 30% de probabilidad cada noche
+		multiplier = 1.3,     -- x1.3 multiplicador
+		nightOverrides = {
+			-- Lighting
+			brightness = 0.1,
+			ambient = Color3.fromRGB(80, 10, 10),
+			outdoorAmbient = Color3.fromRGB(60, 8, 8),
+			fogColor = Color3.fromRGB(40, 5, 5),
+			colorShiftTop = Color3.fromRGB(120, 20, 20),
+			colorShiftBottom = Color3.fromRGB(50, 5, 5),
+			-- Sky
+			starCount = 1500,
+			moonAngularSize = 14,
+			-- Atmosphere
+			atmosphereColor = Color3.new(0.5, 0.08, 0.08),
+			atmosphereDensity = 0.45,
+			atmosphereHaze = 3,
+			-- Clouds
+			cloudColor = Color3.fromRGB(180, 30, 30),
+			cloudCover = 0.7,
+			cloudsEnabled = true,
+			-- ColorCorrection
+			ccTintColor = Color3.fromRGB(255, 170, 170),
+			ccBrightness = -0.05,
+			ccContrast = 0.15,
+			ccSaturation = 0.2,
+		},
+	},
+	{
+		name = "Noche Espacial",
+		probability = 0.05,   -- 5% de probabilidad cada noche
+		multiplier = 2.4,     -- x2.4 multiplicador
+		nightOverrides = {
+			-- Lighting
+			brightness = 0.05,
+			ambient = Color3.fromRGB(5, 5, 20),
+			outdoorAmbient = Color3.fromRGB(5, 5, 20),
+			fogColor = Color3.fromRGB(2, 2, 10),
+			colorShiftTop = Color3.fromRGB(15, 15, 50),
+			colorShiftBottom = Color3.fromRGB(2, 2, 10),
+			-- Sky
+			starCount = 10000,
+			moonAngularSize = 16,
+			-- Atmosphere
+			atmosphereColor = Color3.new(0.02, 0.02, 0.08),
+			atmosphereDensity = 0.05,
+			atmosphereHaze = 0,
+			-- Clouds
+			cloudColor = Color3.fromRGB(255, 255, 255),
+			cloudCover = 0,
+			cloudsEnabled = false,
+			-- ColorCorrection
+			ccTintColor = Color3.fromRGB(220, 220, 255),
+			ccBrightness = -0.1,
+			ccContrast = 0.25,
+			ccSaturation = -0.1,
+		},
+	},
+}
+
+-- ============================================
+-- ESTADO DEL EVENTO ACTUAL
+-- ============================================
+local currentEvent = nil
+local currentMultiplier = 1.0
+local wasNight = false
+
+-- ============================================
+-- REFERENCIAS A OBJETOS
+-- ============================================
+local sky = Lighting:FindFirstChild("Sky")
+local atmosphere = Lighting:FindFirstChild("Atmosphere")
+local clouds = Terrain and Terrain:FindFirstChild("Clouds")
+local colorCorrection = Lighting:FindFirstChild("ColorCorrection")
+
+-- ============================================
+-- VALORES ORIGINALES (para restaurar al terminar el evento)
+-- ============================================
+local DEFAULTS = {
+	starCount = sky and sky.StarCount or 3000,
+	moonAngularSize = sky and sky.MoonAngularSize or 11,
+	atmosphereColor = atmosphere and atmosphere.Color or Color3.new(0.78, 0.67, 0.42),
+	atmosphereDensity = atmosphere and atmosphere.Density or 0.316,
+	atmosphereHaze = atmosphere and atmosphere.Haze or 0,
+	cloudColor = clouds and clouds.Color or Color3.new(1, 1, 1),
+	cloudCover = clouds and clouds.Cover or 0.65,
+	cloudsEnabled = clouds and clouds.Enabled or true,
+	ccTintColor = colorCorrection and colorCorrection.TintColor or Color3.new(1, 1, 1),
+	ccBrightness = colorCorrection and colorCorrection.Brightness or 0.1,
+	ccContrast = colorCorrection and colorCorrection.Contrast or 0,
+	ccSaturation = colorCorrection and colorCorrection.Saturation or 0,
+}
+
+-- ============================================
+-- VALORES COMPARTIDOS EN REPLICATEDSTORAGE
+-- ============================================
+-- Otros scripts pueden leer estos valores para saber qué evento está activo
+-- Ejemplo: local mult = ReplicatedStorage.NightEvents.Multiplier.Value
+
+local eventFolder = ReplicatedStorage:FindFirstChild("NightEvents")
+if not eventFolder then
+	eventFolder = Instance.new("Folder")
+	eventFolder.Name = "NightEvents"
+	eventFolder.Parent = ReplicatedStorage
+end
+
+local eventNameValue = eventFolder:FindFirstChild("CurrentEvent")
+if not eventNameValue then
+	eventNameValue = Instance.new("StringValue")
+	eventNameValue.Name = "CurrentEvent"
+	eventNameValue.Parent = eventFolder
+end
+eventNameValue.Value = "Ninguno"
+
+local eventMultiplierValue = eventFolder:FindFirstChild("Multiplier")
+if not eventMultiplierValue then
+	eventMultiplierValue = Instance.new("NumberValue")
+	eventMultiplierValue.Name = "Multiplier"
+	eventMultiplierValue.Parent = eventFolder
+end
+eventMultiplierValue.Value = 1.0
+
+-- ============================================
+-- FUNCIONES AUXILIARES
+-- ============================================
+
+-- Función para interpolar colores suavemente
+local function lerpColor(a, b, t)
+	return Color3.new(
+		a.R + (b.R - a.R) * t,
+		a.G + (b.G - a.G) * t,
+		a.B + (b.B - a.B) * t
+	)
+end
+
+-- Función para interpolar números
+local function lerp(a, b, t)
+	return a + (b - a) * t
+end
+
+-- Calcular factor de día/noche basado en ClockTime
+-- 0 = noche completa, 1 = día completo
+local function getDayNightFactor(clockTime)
+	if clockTime >= 7 and clockTime <= 17 then
+		return 1 -- Pleno día
+	elseif clockTime >= 19 or clockTime <= 5 then
+		return 0 -- Plena noche
+	elseif clockTime > 5 and clockTime < 7 then
+		-- Amanecer: transición de noche a día
+		return (clockTime - 5) / 2
+	else -- clockTime > 17 and clockTime < 19
+		-- Atardecer: transición de día a noche
+		return 1 - (clockTime - 17) / 2
+	end
+end
+
+-- Seleccionar evento aleatorio basado en probabilidades
+local function rollEvent()
+	local roll = math.random()
+	local cumulative = 0
+
+	for _, event in NIGHT_EVENTS do
+		cumulative = cumulative + event.probability
+		if roll <= cumulative then
+			return event
+		end
+	end
+
+	return nil -- Noche normal (sin evento)
+end
+
+-- Aplicar efectos visuales del evento con transición suave
+local function applyEventEffects(event, dayFactor)
+	local nightIntensity = 1 - dayFactor -- 0=día, 1=noche
+	if nightIntensity <= 0.01 then return end
+
+	local o = event.nightOverrides
+
+	-- Lighting
+	Lighting.Brightness = lerp(NIGHT_BRIGHTNESS, o.brightness, nightIntensity)
+	Lighting.Ambient = lerpColor(NIGHT_AMBIENT, o.ambient, nightIntensity)
+	Lighting.OutdoorAmbient = lerpColor(NIGHT_OUTDOOR_AMBIENT, o.outdoorAmbient, nightIntensity)
+	Lighting.FogColor = lerpColor(NIGHT_FOG_COLOR, o.fogColor, nightIntensity)
+	Lighting.ColorShift_Top = lerpColor(NIGHT_COLOR_SHIFT_TOP, o.colorShiftTop, nightIntensity)
+	Lighting.ColorShift_Bottom = lerpColor(NIGHT_COLOR_SHIFT_BOTTOM, o.colorShiftBottom, nightIntensity)
+
+	-- Sky
+	if sky then
+		sky.StarCount = math.floor(lerp(DEFAULTS.starCount, o.starCount, nightIntensity))
+		sky.MoonAngularSize = math.floor(lerp(DEFAULTS.moonAngularSize, o.moonAngularSize, nightIntensity))
+	end
+
+	-- Atmosphere
+	if atmosphere then
+		atmosphere.Color = lerpColor(DEFAULTS.atmosphereColor, o.atmosphereColor, nightIntensity)
+		atmosphere.Density = lerp(DEFAULTS.atmosphereDensity, o.atmosphereDensity, nightIntensity)
+		atmosphere.Haze = lerp(DEFAULTS.atmosphereHaze, o.atmosphereHaze, nightIntensity)
+	end
+
+	-- Clouds
+	if clouds then
+		clouds.Color = lerpColor(DEFAULTS.cloudColor, o.cloudColor, nightIntensity)
+		clouds.Cover = lerp(DEFAULTS.cloudCover, o.cloudCover, nightIntensity)
+		-- Solo desactivar nubes si el evento lo indica Y ya está bastante oscuro
+		if not o.cloudsEnabled then
+			clouds.Enabled = nightIntensity < 0.8
+		else
+			clouds.Enabled = true
+		end
+	end
+
+	-- ColorCorrection
+	if colorCorrection then
+		colorCorrection.TintColor = lerpColor(DEFAULTS.ccTintColor, o.ccTintColor, nightIntensity)
+		colorCorrection.Brightness = lerp(DEFAULTS.ccBrightness, o.ccBrightness, nightIntensity)
+		colorCorrection.Contrast = lerp(DEFAULTS.ccContrast, o.ccContrast, nightIntensity)
+		colorCorrection.Saturation = lerp(DEFAULTS.ccSaturation, o.ccSaturation, nightIntensity)
+	end
+end
+
+-- Restaurar todos los valores a sus originales
+local function restoreDefaults()
+	if sky then
+		sky.StarCount = DEFAULTS.starCount
+		sky.MoonAngularSize = DEFAULTS.moonAngularSize
+	end
+	if atmosphere then
+		atmosphere.Color = DEFAULTS.atmosphereColor
+		atmosphere.Density = DEFAULTS.atmosphereDensity
+		atmosphere.Haze = DEFAULTS.atmosphereHaze
+	end
+	if clouds then
+		clouds.Color = DEFAULTS.cloudColor
+		clouds.Cover = DEFAULTS.cloudCover
+		clouds.Enabled = DEFAULTS.cloudsEnabled
+	end
+	if colorCorrection then
+		colorCorrection.TintColor = DEFAULTS.ccTintColor
+		colorCorrection.Brightness = DEFAULTS.ccBrightness
+		colorCorrection.Contrast = DEFAULTS.ccContrast
+		colorCorrection.Saturation = DEFAULTS.ccSaturation
+	end
+end
+
+-- ============================================
+-- BUCLE PRINCIPAL DEL CICLO
+-- ============================================
+while true do
+	local currentTime = Lighting.ClockTime
+	local dayFactor = getDayNightFactor(currentTime)
+	local isNight = dayFactor < 0.5
+
+	-- Detectar inicio de la noche → tirar evento
+	if isNight and not wasNight then
+		currentEvent = rollEvent()
+		if currentEvent then
+			currentMultiplier = currentEvent.multiplier
+			eventNameValue.Value = currentEvent.name
+			eventMultiplierValue.Value = currentMultiplier
+			print("🌙 Evento nocturno: " .. currentEvent.name .. " (x" .. currentMultiplier .. ")")
+		else
+			currentMultiplier = 1.0
+			eventNameValue.Value = "Ninguno"
+			eventMultiplierValue.Value = 1.0
+			print("🌙 Noche normal (x1.0)")
+		end
+	end
+
+	-- Detectar inicio del día → limpiar evento y restaurar
+	if not isNight and wasNight then
+		currentEvent = nil
+		currentMultiplier = 1.0
+		eventNameValue.Value = "Ninguno"
+		eventMultiplierValue.Value = 1.0
+		restoreDefaults()
+	end
+
+	wasNight = isNight
+
+	-- Aplicar iluminación
+	if currentEvent then
+		applyEventEffects(currentEvent, dayFactor)
+	else
+		-- Ciclo normal de día/noche
+		Lighting.Brightness = lerp(NIGHT_BRIGHTNESS, DAY_BRIGHTNESS, dayFactor)
+		Lighting.Ambient = lerpColor(NIGHT_AMBIENT, DAY_AMBIENT, dayFactor)
+		Lighting.OutdoorAmbient = lerpColor(NIGHT_OUTDOOR_AMBIENT, DAY_OUTDOOR_AMBIENT, dayFactor)
+		Lighting.FogColor = lerpColor(NIGHT_FOG_COLOR, DAY_FOG_COLOR, dayFactor)
+		Lighting.ColorShift_Top = lerpColor(NIGHT_COLOR_SHIFT_TOP, DAY_COLOR_SHIFT_TOP, dayFactor)
+		Lighting.ColorShift_Bottom = lerpColor(NIGHT_COLOR_SHIFT_BOTTOM, DAY_COLOR_SHIFT_BOTTOM, dayFactor)
+	end
+
+	-- Avanzar el tiempo
+	Lighting.ClockTime = (Lighting.ClockTime + HOURS_PER_SECOND) % 24
+
+	task.wait(1)
+end
