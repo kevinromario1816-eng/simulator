@@ -1,0 +1,348 @@
+-- ============================================
+-- Sistema de Diálogos NPC - Configuración
+-- Define NPCs con árboles de diálogo interactivos
+-- El jugador descubre las misiones a través de conversación
+-- Fácilmente escalable: agregar un NPC = agregar una entrada
+-- ============================================
+--
+-- Estructura de diálogoTree:
+--   [nodeId] = {
+--       npcText = "Lo que dice el NPC",
+--       choices = {
+--           { text = "Opción del jugador", next = "siguiente_nodo" }
+--           { text = "Opción con acción", action = "accept_mission" }
+--           { text = "Cerrar diálogo", action = "close" }
+--       }
+--   }
+--
+-- Acciones especiales:
+--   "accept_mission"  - Aceptar la misión del NPC
+--   "complete_mission" - Completar la misión del NPC
+--   "close" - Cerrar el diálogo
+--
+-- Nodos de inicio según estado de misión:
+--   "available"   -> Nodo de inicio (primera vez o misión disponible)
+--   "active"      -> Nodo cuando la misión está en progreso
+--   "completable" -> Nodo cuando la misión se puede completar
+--   "completed"   -> Nodo cuando la misión ya fue completada
+--   "cooldown"    -> Nodo cuando está en cooldown (repetible)
+-- ============================================
+
+return {
+	NPCs = {
+		-- ==============================
+		-- BAGABUNDO - Entrenamiento Offline
+		-- ==============================
+		{
+			id = "bagabundo",
+			name = "Bagabundo",
+			title = "El Vagabundo",
+			color = {139, 90, 43},
+			skinColor = {210, 180, 140},
+			shirtColor = {101, 67, 33},
+			pantsColor = {80, 50, 20},
+			dialogueTree = {
+				-- Primera vez / misión disponible
+				available = {
+					npcText = "¡Eh, tú! ¿Tienes un momento? Este viejo necesita un favor...",
+					choices = {
+						{ text = "¿Qué necesitas?", next = "explain" },
+						{ text = "No tengo tiempo.", next = "dismiss" },
+					},
+				},
+				explain = {
+					npcText = "Necesito una espada para defenderme. Las calles son peligrosas para un viejo como yo... ¿Tienes alguna que ya no uses?",
+					choices = {
+						{ text = "¿Y qué me das a cambio?", next = "offer" },
+						{ text = "No tengo espadas.", next = "no_sword" },
+						{ text = "Mejor no, adiós.", next = "dismiss" },
+					},
+				},
+				offer = {
+					npcText = "No tengo oro... pero puedo cuidar de tu entrenamiento mientras descansas. Entrenaré por ti cuando te vayas, aunque solo sea un 1% de tu fuerza. Es lo mejor que puedo ofrecer.",
+					choices = {
+						{ text = "Trato hecho, toma mi espada.", action = "accept_mission" },
+						{ text = "Solo 1%? No me convence.", next = "refuse" },
+					},
+				},
+				no_sword = {
+					npcText = "Oh... vuelve cuando tengas una espada que puedas regalarme. Este viejo no durará mucho sin protección...",
+					choices = {
+						{ text = "Volveré cuando tenga una.", action = "close" },
+					},
+				},
+				refuse = {
+					npcText = "Lo entiendo... es poco, lo sé. Pero si cambias de opinión, sabes dónde encontrarme.",
+					choices = {
+						{ text = "Hasta luego.", action = "close" },
+					},
+				},
+				dismiss = {
+					npcText = "Bueno, si cambias de opinión... sabes dónde encontrarme.",
+					choices = {
+						{ text = "Adiós.", action = "close" },
+					},
+				},
+				-- Misión activa (jugando para completar)
+				active = {
+					npcText = "¿Ya tienes una espada para mí? Vuelve cuando tengas una que puedas regalarme.",
+					choices = {
+						{ text = "Estoy buscando una.", next = "active_encourage" },
+						{ text = "Me voy.", action = "close" },
+					},
+				},
+				active_encourage = {
+					npcText = "Apresúrate... este viejo no puede defenderse sin una espada.",
+					choices = {
+						{ text = "Volveré pronto.", action = "close" },
+					},
+				},
+				-- Misión completable
+				completable = {
+					npcText = "¡Veo que tienes una espada! ¿Me la regalarías como prometiste?",
+					choices = {
+						{ text = "Aquí tienes, es tuya.", action = "complete_mission" },
+						{ text = "Mejor no, la necesito.", next = "keep_waiting" },
+					},
+				},
+				keep_waiting = {
+					npcText = "Está bien... seguiré esperando.",
+					choices = {
+						{ text = "Adiós.", action = "close" },
+					},
+				},
+				-- Misión completada (no repetible)
+				completed = {
+					npcText = "Sigo entrenando por ti, amigo. ¡No te preocupes por nada!",
+					choices = {
+						{ text = "Gracias, viejo amigo.", action = "close" },
+					},
+				},
+			},
+			mission = {
+				id = "npc_bagabundo",
+				name = "Espada para el Vagabundo",
+				description = "Regálale una espada al Bagabundo",
+				type = "give_sword",
+				repeatable = false,
+				reward = {
+					type = "offline_training",
+					dpsPercent = 1,
+				},
+			},
+		},
+
+		-- ==============================
+		-- MERCADER DE SOMBRAS - Poder por Espada
+		-- ==============================
+		{
+			id = "mercader_sombras",
+			name = "Mercader de Sombras",
+			title = "El Negociante Oscuro",
+			color = {75, 0, 130},
+			skinColor = {180, 160, 200},
+			shirtColor = {40, 0, 80},
+			pantsColor = {20, 0, 40},
+			dialogueTree = {
+				-- Misión disponible
+				available = {
+					npcText = "¿Qué tienes ahí? Puedo sentir tu poder desde lejos... ¿Te interesaría un trato?",
+					choices = {
+						{ text = "¿Qué tipo de trato?", next = "explain" },
+						{ text = "No negocio con extraños.", next = "dismiss" },
+					},
+				},
+				explain = {
+					npcText = "Soy un mercador de poder. Tú me das una parte del tuyo... y yo te presto algo a cambio. Algo que no se encuentra en ninguna tienda.",
+					choices = {
+						{ text = "¿Qué me prestarías?", next = "reveal" },
+						{ text = "Suena sospechoso. Me voy.", next = "dismiss" },
+					},
+				},
+				reveal = {
+					npcText = "Mi espada sombría... una espada que corta entre dimensiones. Te la prestaré por 5 minutos. El precio: solo el 10% de tu poder actual.",
+					choices = {
+						{ text = "Acepto el trato.", action = "accept_mission" },
+						{ text = "10% es mucho. Lo pensaré.", next = "refuse" },
+					},
+				},
+				refuse = {
+					npcText = "El poder tiene su precio... Vuelve cuando estés listo para negociar.",
+					choices = {
+						{ text = "Hasta luego.", action = "close" },
+					},
+				},
+				dismiss = {
+					npcText = "Mm... todos vuelven eventualmente. El poder es tentador.",
+					choices = {
+						{ text = "Adiós.", action = "close" },
+					},
+				},
+				-- Misión activa
+				active = {
+					npcText = "¿Aún no estás listo para el trato? Vuelve cuando quieras negociar.",
+					choices = {
+						{ text = "¿Me recuerdas el trato?", next = "active_remind" },
+						{ text = "Me voy.", action = "close" },
+					},
+				},
+				active_remind = {
+					npcText = "Dame el 10% de tu poder y te presto mi espada sombría por 5 minutos. Simple.",
+					choices = {
+						{ text = "Acepto el trato.", action = "accept_mission" },
+						{ text = "Lo pensaré.", action = "close" },
+					},
+				},
+				-- Misión completable
+				completable = {
+					npcText = "Tienes el poder necesario... ¿cerramos el trato?",
+					choices = {
+						{ text = "Trato hecho.", action = "complete_mission" },
+						{ text = "Mejor no.", next = "refuse" },
+					},
+				},
+				-- Misión completada + cooldown
+				completed = {
+					npcText = "Ya hicimos trato, ¿no? Vuelve cuando necesites otro intercambio...",
+					choices = {
+						{ text = "¿Puedo hacer otro trato?", next = "repeat_check" },
+						{ text = "Adiós.", action = "close" },
+					},
+				},
+				repeat_check = {
+					npcText = "Mm... todavía no. El trato necesita tiempo para renovarse. Vuelve más tarde.",
+					choices = {
+						{ text = "Entendido.", action = "close" },
+					},
+				},
+				-- Cooldown activo
+				cooldown = {
+					npcText = "El trato aún se está renovando... vuelve más tarde.",
+					choices = {
+						{ text = "Entendido.", action = "close" },
+					},
+				},
+			},
+			mission = {
+				id = "npc_mercader_sombras",
+				name = "Poder por Espada",
+				description = "Dale 10% de tu poder al Mercader de Sombras",
+				type = "give_power_percent",
+				powerPercent = 10,
+				repeatable = true,
+				cooldown = 360,
+				reward = {
+					type = "borrow_weapon",
+					weapon = "ShadowSword",
+					duration = 300,
+				},
+			},
+		},
+
+		-- ==============================
+		-- ERMITAÑO DEL TIEMPO - Buff Temporal
+		-- ==============================
+		{
+			id = "ermitano_tiempo",
+			name = "Ermitaño del Tiempo",
+			title = "El Guardián del Tiempo",
+			color = {0, 150, 200},
+			skinColor = {200, 220, 240},
+			shirtColor = {0, 80, 120},
+			pantsColor = {0, 50, 80},
+			dialogueTree = {
+				-- Misión disponible
+				available = {
+					npcText = "El tiempo fluye como un río... ¿Cuánto tiempo has dedicado a entrenar, guerrero?",
+					choices = {
+						{ text = "¿Por qué lo preguntas?", next = "explain" },
+						{ text = "No tengo tiempo para charlar.", next = "dismiss" },
+					},
+				},
+				explain = {
+					npcText = "Porque el tiempo es poder. Dedica 15 minutos a tu entrenamiento y te otorgaré una bendición... algo que multiplicará tu fuerza.",
+					choices = {
+						{ text = "¿Qué tipo de bendición?", next = "reveal" },
+						{ text = "15 minutos es mucho.", next = "refuse" },
+					},
+				},
+				reveal = {
+					npcText = "Un buff que multiplicará tu poder por 2 durante 2 minutos. El tiempo es tu aliado... si estás dispuesto a dedicárselo.",
+					choices = {
+						{ text = "Acepto, entrenaré 15 minutos.", action = "accept_mission" },
+						{ text = "Lo pensaré.", next = "refuse" },
+					},
+				},
+				refuse = {
+					npcText = "El tiempo no espera a nadie... pero yo sí. Vuelve cuando estés listo.",
+					choices = {
+						{ text = "Hasta luego.", action = "close" },
+					},
+				},
+				dismiss = {
+					npcText = "El tiempo es el recurso más valioso... no lo desperdicies.",
+					choices = {
+						{ text = "Adiós.", action = "close" },
+					},
+				},
+				-- Misión activa (entrenando)
+				active = {
+					npcText = "Aún no has entrenado lo suficiente... el tiempo no miente. Vuelve cuando hayas dedicado 15 minutos.",
+					choices = {
+						{ text = "¿Cuánto me falta?", next = "active_check" },
+						{ text = "Volveré después.", action = "close" },
+					},
+				},
+				active_check = {
+					npcText = "El tiempo lo sabe... sigue entrenando. Cuando estés listo, la bendición será tuya.",
+					choices = {
+						{ text = "Entendido, seguiré entrenando.", action = "close" },
+					},
+				},
+				-- Misión completable
+				completable = {
+					npcText = "Has dedicado suficiente tiempo al entrenamiento... tu bendición está lista. ¿La aceptas?",
+					choices = {
+						{ text = "Sí, otórgame la bendición.", action = "complete_mission" },
+						{ text = "Aún no.", next = "refuse" },
+					},
+				},
+				-- Misión completada
+				completed = {
+					npcText = "Mi bendición ya está sobre ti. El tiempo te favorece... ¿Buscas otra?",
+					choices = {
+						{ text = "¿Puedo recibir otra bendición?", next = "repeat_check" },
+						{ text = "Gracias, adiós.", action = "close" },
+					},
+				},
+				repeat_check = {
+					npcText = "La bendición necesita tiempo para renovarse... vuelve más tarde y dedica otros 15 minutos.",
+					choices = {
+						{ text = "Entendido.", action = "close" },
+					},
+				},
+				-- Cooldown activo
+				cooldown = {
+					npcText = "La bendición aún se está renovando... la paciencia es una virtud.",
+					choices = {
+						{ text = "Volveré después.", action = "close" },
+					},
+				},
+			},
+			mission = {
+				id = "npc_ermitano_tiempo",
+				name = "15 Minutos de Entrenamiento",
+				description = "Juega durante 15 minutos para recibir una bendición",
+				type = "play_time",
+				requiredMinutes = 15,
+				repeatable = true,
+				cooldown = 600,
+				reward = {
+					type = "temporary_buff",
+					multiplier = 2,
+					duration = 120,
+				},
+			},
+		},
+	},
+}
