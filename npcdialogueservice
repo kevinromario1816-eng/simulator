@@ -1,0 +1,616 @@
+-- ============================================
+-- Ascensión de Guerreros - NPCDialogueService
+-- Sistema de diálogos y misiones de NPCs
+-- Modular y escalable: agregar NPCs en NPCDialogues config
+-- ============================================
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players           = game:GetService("Players")
+
+local Config            = require(ReplicatedStorage.Shared.Config.GameConfig)
+local NPCDialogues      = require(ReplicatedStorage.Shared.Config.Modules.NPCDialogues)
+local RemoteUtil        = require(ReplicatedStorage.Shared.Util.RemoteUtil)
+local SharedUtil        = require(ReplicatedStorage.Shared.Util.SharedUtil)
+
+local NPCDialogueService = {}
+
+local DataService
+local WeaponService
+local CombatService
+
+-- ========================
+-- INYECCIÓN DE DEPENDENCIAS
+-- ========================
+function NPCDialogueService:Inject(dataService, weaponService, combatService)
+	DataService = dataService
+	WeaponService = weaponService
+	CombatService = combatService
+end
+
+-- ========================
+-- HELPERS
+-- ========================
+local function getNPCConfig(npcId)
+	for _, npc in ipairs(NPCDialogues.NPCs) do
+		if npc.id == npcId then
+			return npc
+		end
+	end
+	return nil
+end
+
+local function getMissionState(data, npcId)
+	if not data.NPCMissions then data.NPCMissions = {} end
+	return data.NPCMissions[npcId] or { status = "available" }
+end
+
+local function isOnCooldown(data, npcId)
+	local state = getMissionState(data, npcId)
+	if state.cooldownEnd and os.time() < state.cooldownEnd then
+		return true, state.cooldownEnd - os.time()
+	end
+	return false, 0
+end
+
+-- ========================
+-- OBTENER ESTADO DE DIÁLOGO
+-- ========================
+function NPCDialogueService:GetDialogueState(player, npcId)
+	local npcConfig = getNPCConfig(npcId)
+	if not npcConfig then
+		return nil, "NPC no encontrado"
+	end
+
+	local data = DataService:GetData(player)
+	if not data then
+		return nil, "Sin datos"
+	end
+
+	local missionState = getMissionState(data, npcId)
+	local onCooldown, cooldownRemaining = isOnCooldown(data, npcId)
+
+	-- Determinar el estado de misión para que el cliente seleccione el nodo correcto del dialogueTree
+	local missionStatus = "available"
+	local missionProgress = 0
+	local missionTarget = 0
+
+	if missionState.status == "completed" then
+		if npcConfig.mission.repeatable then
+			if onCooldown then
+				missionStatus = "cooldown"
+			else
+				missionStatus = "available" -- Puede repetir
+			end
+		else
+				missionStatus = "completed"
+		end
+	elseif missionState.status == "active" then
+		local canComplete, progress, target = self:CheckMissionProgress(player, npcId)
+		missionProgress = progress
+		missionTarget = target
+		if canComplete then
+			missionStatus = "completable"
+		else
+			missionStatus = "active"
+		end
+	else
+		missionStatus = "available"
+	end
+
+	return {
+		npcId = npcId,
+		npcName = npcConfig.name,
+		npcTitle = npcConfig.title,
+		npcColor = npcConfig.color,
+		missionStatus = missionStatus,
+		missionProgress = missionProgress,
+		missionTarget = missionTarget,
+		onCooldown = onCooldown,
+		cooldownRemaining = cooldownRemaining,
+	}
+end
+
+-- ========================
+-- VERIFICAR PROGRESO DE MISIÓN
+-- ========================
+function NPCDialogueService:CheckMissionProgress(player, npcId)
+	local npcConfig = getNPCConfig(npcId)
+	if not npcConfig then return false, 0, 0 end
+
+	local data = DataService:GetData(player)
+	if not data then return false, 0, 0 end
+
+	local mission = npcConfig.mission
+
+	if mission.type == "give_sword" then
+		-- Siempre puede completar si tiene al menos una espada
+		local unlockedWeapons = data.UnlockedWeapons or {}
+		local hasSword = #unlockedWeapons > 0 or data.EquippedWeapon ~= nil
+		return hasSword, hasSword and 1 or 0, 1
+
+	elseif mission.type == "give_power_percent" then
+		-- Siempre puede completar si tiene poder > 0
+		local totalPower = SharedUtil.CalculateTotalPower(data)
+		local canAfford = totalPower > 0
+		return canAfford, canAfford and 1 or 0, 1
+
+	elseif mission.type == "play_time" then
+		-- Verificar tiempo de juego desde que aceptó la misión
+		local missionState = getMissionState(data, npcId)
+		local acceptedAt = missionState.acceptedAt or 0
+		local elapsed = os.time() - acceptedAt
+		local requiredSeconds = (mission.requiredMinutes or 15) * 60
+		local progress = math.min(elapsed, requiredSeconds)
+		return elapsed >= requiredSeconds, progress, requiredSeconds
+	end
+
+	return false, 0, 0
+end
+
+-- ========================
+-- ACEPTAR MISIÓN NPC
+-- ========================
+function NPCDialogueService:AcceptMission(player, npcId)
+	local npcConfig = getNPCConfig(npcId)
+	if not npcConfig then
+		return false, "NPC no encontrado"
+	end
+
+	local data = DataService:GetData(player)
+	if not data then
+		return false, "Sin datos"
+	end
+
+	if not data.NPCMissions then data.NPCMissions = {} end
+
+	local missionState = data.NPCMissions[npcId]
+
+	-- Verificar si ya está activa
+	if missionState and missionState.status == "active" then
+		return false, "Misión ya activa"
+	end
+
+	-- Verificar cooldown si es repetible
+	if npcConfig.mission.repeatable and missionState and missionState.cooldownEnd then
+		if os.time() < missionState.cooldownEnd then
+			return false, "En cooldown"
+		end
+	end
+
+	-- Verificar requisitos según tipo
+	local mission = npcConfig.mission
+
+	if mission.type == "give_sword" then
+		-- Verificar que tiene al menos una espada (la default no cuenta)
+		local unlockedWeapons = data.UnlockedWeapons or {}
+		if #unlockedWeapons == 0 then
+			return false, "Necesitas al menos una espada para regalar"
+		end
+	elseif mission.type == "give_power_percent" then
+		local totalPower = SharedUtil.CalculateTotalPower(data)
+		if totalPower <= 0 then
+			return false, "No tienes poder para ofrecer"
+		end
+	elseif mission.type == "play_time" then
+		-- No hay requisito previo, solo aceptar
+		-- Nada que verificar
+	end
+
+	-- Activar misión
+	data.NPCMissions[npcId] = {
+		status = "active",
+		acceptedAt = os.time(),
+		completedAt = 0,
+		cooldownEnd = 0,
+	}
+
+	-- Para misiones de tipo give_sword y give_power_percent, se completan automáticamente
+	if mission.type == "give_sword" or mission.type == "give_power_percent" then
+		local success, result = self:CompleteMission(player, npcId)
+		return success, result
+	end
+
+	-- Notificar al cliente
+	RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCMissionUpdate, player, npcId, "active", 0)
+
+	return true, { status = "active", npcId = npcId }
+end
+
+-- ========================
+-- COMPLETAR MISIÓN NPC
+-- ========================
+function NPCDialogueService:CompleteMission(player, npcId)
+	local npcConfig = getNPCConfig(npcId)
+	if not npcConfig then
+		return false, "NPC no encontrado"
+	end
+
+	local data = DataService:GetData(player)
+	if not data then
+		return false, "Sin datos"
+	end
+
+	if not data.NPCMissions then data.NPCMissions = {} end
+	local missionState = data.NPCMissions[npcId]
+
+	if not missionState or missionState.status ~= "active" then
+		return false, "Misión no activa"
+	end
+
+	-- Verificar progreso
+	local canComplete = self:CheckMissionProgress(player, npcId)
+	if not canComplete then
+		return false, "Requisitos no cumplidos"
+	end
+
+	local mission = npcConfig.mission
+	local reward = mission.reward
+
+	-- ========================
+	-- APLICAR COSTO DE MISIÓN
+	-- ========================
+	if mission.type == "give_sword" then
+		-- Quitar la última espada desbloqueada (no la default)
+		local unlockedWeapons = data.UnlockedWeapons or {}
+		if #unlockedWeapons > 0 then
+			local removedWeapon = table.remove(unlockedWeapons)
+			-- Si tenía equipada esa arma, equipar la mejor restante
+			if data.EquippedWeapon == removedWeapon then
+				data.EquippedWeapon = "Sword"
+				if WeaponService then
+					task.defer(function()
+						WeaponService:EquipBestWeapon(player, unlockedWeapons)
+					end)
+				end
+			end
+		end
+
+	elseif mission.type == "give_power_percent" then
+		-- Quitar 10% del poder
+		local totalPower = SharedUtil.CalculateTotalPower(data)
+		local powerToRemove = math.floor(totalPower * (mission.powerPercent / 100))
+		if data.TotalRebirthPower then
+			data.TotalRebirthPower = math.max(0, data.TotalRebirthPower - powerToRemove)
+		end
+		if data.Power then
+			data.Power = math.max(0, data.Power - powerToRemove)
+		end
+	end
+
+	-- ========================
+	-- APLICAR RECOMPENSA
+	-- ========================
+	local rewardData = { type = reward.type, npcId = npcId, npcName = npcConfig.name }
+
+	if reward.type == "offline_training" then
+		-- Activar entrenamiento offline permanente
+		if not data.OfflineTraining then data.OfflineTraining = {} end
+		data.OfflineTraining.Enabled = true
+		data.OfflineTraining.AccumulatedPower = 0
+		rewardData.message = "¡Entrenamiento offline activado! El Bagabundo entrenará por ti cuando te vayas (1% DPS)."
+
+	elseif reward.type == "borrow_weapon" then
+		-- Prestar arma temporalmente
+		if not data.BorrowedWeapon then data.BorrowedWeapon = {} end
+		data.BorrowedWeapon.weaponName = reward.weapon
+		data.BorrowedWeapon.endTime = os.time() + reward.duration
+
+		-- Equipar el arma prestada
+		if WeaponService then
+			task.defer(function()
+				local weaponConfig = require(ReplicatedStorage.Shared.Config.Modules.Weapons)
+				local weaponData = weaponConfig:GetWeapon(reward.weapon)
+				if weaponData then
+					WeaponService:EquipUnlockedWeapon(player, weaponData.model)
+					if data then
+						data.WeaponMultiplier = weaponData.damage * 2 -- Espada prestada con doble poder
+					end
+				end
+			end)
+		end
+
+		-- Timer para devolver el arma
+		task.defer(function()
+			task.wait(reward.duration)
+			if not player.Parent then return end
+			self:RevokeBorrowedWeapon(player)
+		end)
+
+		rewardData.message = "¡Espada sombría prestada por " .. math.floor(reward.duration / 60) .. " minutos!"
+		rewardData.duration = reward.duration
+
+	elseif reward.type == "temporary_buff" then
+		-- Aplicar buff temporal
+		if not data.NPCBuff then data.NPCBuff = {} end
+		data.NPCBuff.multiplier = reward.multiplier
+		data.NPCBuff.endTime = os.time() + reward.duration
+
+		-- Timer para quitar el buff
+		task.defer(function()
+			task.wait(reward.duration)
+			if not player.Parent then return end
+			self:RevokeBuff(player)
+		end)
+
+		rewardData.message = "¡Buff x" .. reward.multiplier .. " activado por " .. math.floor(reward.duration / 60) .. " minutos!"
+		rewardData.multiplier = reward.multiplier
+		rewardData.duration = reward.duration
+	end
+
+	-- Actualizar estado de misión
+	local cooldownEnd = 0
+	if mission.repeatable and mission.cooldown then
+		cooldownEnd = os.time() + mission.cooldown
+	end
+
+	data.NPCMissions[npcId] = {
+		status = "completed",
+		acceptedAt = missionState.acceptedAt or 0,
+		completedAt = os.time(),
+		cooldownEnd = cooldownEnd,
+	}
+
+	-- Notificar al cliente
+	RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCRewardNotification, player, rewardData)
+	RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCMissionUpdate, player, npcId, "completed", 0)
+
+	return true, rewardData
+end
+
+-- ========================
+-- REVOCAR ARMA PRESTADA
+-- ========================
+function NPCDialogueService:RevokeBorrowedWeapon(player)
+	local data = DataService:GetData(player)
+	if not data then return end
+
+	if data.BorrowedWeapon then
+		data.BorrowedWeapon.weaponName = nil
+		data.BorrowedWeapon.endTime = 0
+	end
+
+	-- Re-equipar el mejor arma del jugador
+	if WeaponService then
+		local unlockedWeapons = data.UnlockedWeapons or {}
+		WeaponService:EquipBestWeapon(player, unlockedWeapons)
+	end
+
+	RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCRewardNotification, player, {
+		type = "borrow_expired",
+		message = "La espada prestada ha sido devuelta al Mercader de Sombras.",
+	})
+end
+
+-- ========================
+-- REVOCAR BUFF TEMPORAL
+-- ========================
+function NPCDialogueService:RevokeBuff(player)
+	local data = DataService:GetData(player)
+	if not data then return end
+
+	if data.NPCBuff then
+		data.NPCBuff.multiplier = 1
+		data.NPCBuff.endTime = 0
+	end
+
+	RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCRewardNotification, player, {
+		type = "buff_expired",
+		message = "La bendición del Ermitaño del Tiempo ha expirado.",
+	})
+end
+
+-- ========================
+-- ENTRENAMIENTO OFFLINE
+-- ========================
+function NPCDialogueService:ProcessOfflineTraining(player)
+	local data = DataService:GetData(player)
+	if not data then return end
+
+	if not data.OfflineTraining or not data.OfflineTraining.Enabled then
+		return
+	end
+
+	local lastLeaveTime = data.OfflineTraining.LastLeaveTime or 0
+	if lastLeaveTime == 0 then return end
+
+	local timeAway = os.time() - lastLeaveTime
+	if timeAway <= 0 then return end
+
+	-- Limitar a máximo 24 horas
+	local maxOfflineTime = 86400
+	timeAway = math.min(timeAway, maxOfflineTime)
+
+	-- Calcular poder ganado: DPS * 1% * tiempo
+	local lastDPS = data.OfflineTraining.LastDPS or data.PeakDPS or 0
+	local dpsPercent = 0.01 -- 1%
+	local powerGained = math.floor(lastDPS * dpsPercent * timeAway)
+
+	if powerGained > 0 then
+		DataService:AddPower(player, powerGained)
+		data.OfflineTraining.AccumulatedPower = (data.OfflineTraining.AccumulatedPower or 0) + powerGained
+
+		-- Notificar al cliente
+		RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCRewardNotification, player, {
+			type = "offline_training",
+			message = "El Bagabundo entrenó por ti mientras estabas fuera. ¡Ganaste " .. SharedUtil.FormatNumber(powerGained) .. " de poder!",
+			powerGained = powerGained,
+			timeAway = timeAway,
+		})
+	end
+
+	-- Resetear tiempo de salida
+	data.OfflineTraining.LastLeaveTime = 0
+end
+
+-- ========================
+-- GUARDAR DPS AL SALIR (para entrenamiento offline)
+-- ========================
+function NPCDialogueService:OnPlayerLeaving(player)
+	local data = DataService:GetData(player)
+	if not data then return end
+
+	-- Guardar datos de entrenamiento offline
+	if data.OfflineTraining and data.OfflineTraining.Enabled then
+		data.OfflineTraining.LastLeaveTime = os.time()
+		if CombatService then
+			data.OfflineTraining.LastDPS = CombatService:GetDPS(player) or data.PeakDPS or 0
+		else
+			data.OfflineTraining.LastDPS = data.PeakDPS or 0
+		end
+	end
+
+	-- Guardar tiempo de juego
+	if data.NPCPlayTimeStart and data.NPCPlayTimeStart > 0 then
+		-- Ya se trackea via os.time() - acceptedAt en NPCMissions
+	end
+end
+
+-- ========================
+-- VERIFICAR BUFFS Y ARMAS PRESTADAS AL CARGAR
+-- ========================
+function NPCDialogueService:OnPlayerLoaded(player)
+	local data = DataService:GetData(player)
+	if not data then return end
+
+	-- Procesar entrenamiento offline
+	self:ProcessOfflineTraining(player)
+
+	-- Verificar arma prestada expirada
+	if data.BorrowedWeapon and data.BorrowedWeapon.weaponName then
+		if os.time() >= data.BorrowedWeapon.endTime then
+			-- Ya expiró mientras estaba offline
+			self:RevokeBorrowedWeapon(player)
+		else
+			-- Aún tiene tiempo, re-equipar y poner timer
+			local remaining = data.BorrowedWeapon.endTime - os.time()
+			if WeaponService then
+				task.defer(function()
+					local weaponConfig = require(ReplicatedStorage.Shared.Config.Modules.Weapons)
+					local weaponData = weaponConfig:GetWeapon(data.BorrowedWeapon.weaponName)
+					if weaponData then
+						WeaponService:EquipUnlockedWeapon(player, weaponData.model)
+						if data then
+							data.WeaponMultiplier = weaponData.damage * 2
+						end
+					end
+				end)
+			end
+			task.defer(function()
+				task.wait(remaining)
+				if player.Parent then
+					self:RevokeBorrowedWeapon(player)
+				end
+			end)
+		end
+	end
+
+	-- Verificar buff expirado
+	if data.NPCBuff and data.NPCBuff.multiplier and data.NPCBuff.multiplier > 1 then
+		if os.time() >= data.NPCBuff.endTime then
+			self:RevokeBuff(player)
+		else
+			local remaining = data.NPCBuff.endTime - os.time()
+			task.defer(function()
+				task.wait(remaining)
+				if player.Parent then
+					self:RevokeBuff(player)
+				end
+			end)
+		end
+	end
+
+	-- Verificar misiones activas de tipo play_time
+	if data.NPCMissions then
+		for npcId, missionState in pairs(data.NPCMissions) do
+			if missionState.status == "active" then
+				local npcConfig = getNPCConfig(npcId)
+				if npcConfig and npcConfig.mission.type == "play_time" then
+					local canComplete = self:CheckMissionProgress(player, npcId)
+					if canComplete then
+						RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCMissionUpdate, player, npcId, "completable", 0)
+					end
+				end
+			end
+		end
+	end
+end
+
+-- ========================
+-- LOOP DE VERIFICACIÓN DE MISIONES PLAY_TIME
+-- ========================
+function NPCDialogueService:StartMissionCheckLoop()
+	task.spawn(function()
+		while true do
+			task.wait(30) -- cada 30 segundos
+			for _, player in ipairs(Players:GetPlayers()) do
+				local data = DataService:GetData(player)
+				if data and data.NPCMissions then
+					for npcId, missionState in pairs(data.NPCMissions) do
+						if missionState.status == "active" then
+							local npcConfig = getNPCConfig(npcId)
+							if npcConfig and npcConfig.mission.type == "play_time" then
+								local canComplete, progress, target = self:CheckMissionProgress(player, npcId)
+								RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCMissionUpdate, player, npcId, "active", progress)
+								if canComplete then
+									RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCMissionUpdate, player, npcId, "completable", progress)
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
+-- ========================
+-- INICIALIZACIÓN
+-- ========================
+function NPCDialogueService:Init()
+	-- Registrar eventos de red
+	RemoteUtil.OnServerEvent(Config.Remotes.NPCDialogue.NPCInteract, function(player, npcId)
+		if type(npcId) ~= "string" then return end
+		local dialogueState = self:GetDialogueState(player, npcId)
+		if dialogueState then
+			RemoteUtil.FireClient(Config.Remotes.NPCDialogue.NPCDialogueResponse, player, dialogueState)
+		end
+	end)
+
+	RemoteUtil.OnServerEvent(Config.Remotes.NPCDialogue.AcceptNPCMission, function(player, npcId)
+		if type(npcId) ~= "string" then return end
+		local success, result = self:AcceptMission(player, npcId)
+		RemoteUtil.FireClient(Config.Remotes.NPCDialogue.AcceptNPCMission, player, success, result)
+	end)
+
+	RemoteUtil.OnServerEvent(Config.Remotes.NPCDialogue.CompleteNPCMission, function(player, npcId)
+		if type(npcId) ~= "string" then return end
+		local success, result = self:CompleteMission(player, npcId)
+		RemoteUtil.FireClient(Config.Remotes.NPCDialogue.CompleteNPCMission, player, success, result)
+	end)
+
+	-- Procesar jugadores al cargar datos
+	local function onPlayerLoaded(player)
+		DataService:OnDataLoaded(player, function()
+			if player and player.Parent then
+				self:OnPlayerLoaded(player)
+			end
+		end)
+	end
+
+	Players.PlayerAdded:Connect(onPlayerLoaded)
+	for _, player in ipairs(Players:GetPlayers()) do
+		task.spawn(onPlayerLoaded, player)
+	end
+
+	-- Guardar datos al salir
+	Players.PlayerRemoving:Connect(function(player)
+		self:OnPlayerLeaving(player)
+	end)
+
+	-- Iniciar loop de verificación
+	self:StartMissionCheckLoop()
+
+	print("[NPCDialogueService] Inicializado")
+end
+
+return NPCDialogueService
