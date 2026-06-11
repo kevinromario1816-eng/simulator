@@ -1,0 +1,440 @@
+-- ============================================
+-- Ascensión de Guerreros - NPCDialogueController
+-- Orquestador delgado: delega en módulos
+-- ============================================
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config            = require(ReplicatedStorage.Shared.Config.GameConfig)
+local NPCDialogues      = require(ReplicatedStorage.Shared.Config.Modules.NPCDialogues)
+local RemoteUtil        = require(ReplicatedStorage.Shared.Util.RemoteUtil)
+
+-- Módulos internos
+local Theme             = require(script.Theme)
+local Typewriter        = require(script.Typewriter)
+local ViewportHelper    = require(script.ViewportHelper)
+local ChoiceBuilder     = require(script.ChoiceBuilder)
+local Animations        = require(script.Animations)
+
+local NPCDialogueController = {}
+
+local LocalPlayer = Players.LocalPlayer
+local playerGui
+local dialogueGui
+
+-- ========================
+-- REFERENCIAS GUI
+-- ========================
+local mainFrame
+local topBar
+local leftPanel
+local rightPanel
+local npcNameLabel
+local npcTitleLabel
+local npcSubtitleLabel
+local choicesFrame
+local dialogueFrame
+local dialogueTextLabel
+local speakerIndicator
+local npcViewport
+local notificationFrame
+local notificationText
+local playerFrame
+
+-- ========================
+-- ESTADO
+-- ========================
+local isDialogueOpen    = false
+local currentNpcId      = nil
+local currentNpcConfig  = nil
+local currentNodeId     = nil
+local currentNpcModel   = nil  -- referencia al modelo NPC en workspace
+local pendingNpcModel   = nil  -- modelo NPC guardado al activar prompt
+local distanceCheckConn = nil  -- conexión del loop de distancia
+local MAX_DIALOGUE_DIST  = 20  -- distancia máxima en studs antes de cerrar diálogo
+
+-- Forward declaration (navigateToNode y startDistanceCheck usan closeDialogue)
+local closeDialogue
+
+-- ========================
+-- BUSCAR CONFIG DE NPC
+-- ========================
+local function getNPCConfig(npcId)
+	for _, npc in ipairs(NPCDialogues.NPCs) do
+		if npc.id == npcId then return npc end
+	end
+	return nil
+end
+
+-- ========================
+-- SETUP GUI REFERENCES
+-- ========================
+local function setupGUIReferences()
+	playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if not playerGui then return false end
+
+	dialogueGui = playerGui:FindFirstChild("DialogueGui")
+	if not dialogueGui then return false end
+
+	mainFrame = dialogueGui:FindFirstChild("MainFrame")
+	if not mainFrame then return false end
+
+	topBar           = mainFrame:FindFirstChild("TopBar")
+	npcNameLabel     = topBar and topBar:FindFirstChild("NPCName")
+	npcSubtitleLabel = topBar and topBar:FindFirstChild("NPCSubtitle")
+
+	local contentArea   = mainFrame:FindFirstChild("ContentArea")
+	leftPanel           = contentArea and contentArea:FindFirstChild("LeftPanel")
+	rightPanel          = contentArea and contentArea:FindFirstChild("RightPanel")
+
+	choicesFrame        = leftPanel and leftPanel:FindFirstChild("ChoicesFrame")
+	dialogueFrame       = leftPanel and leftPanel:FindFirstChild("DialogueFrame")
+	dialogueTextLabel   = dialogueFrame and dialogueFrame:FindFirstChild("DialogueText")
+	speakerIndicator    = dialogueFrame and dialogueFrame:FindFirstChild("SpeakerIndicator")
+
+	npcTitleLabel       = rightPanel and rightPanel:FindFirstChild("NPCTitle")
+	npcViewport         = rightPanel and rightPanel:FindFirstChild("NPCViewport")
+
+	notificationFrame   = dialogueGui:FindFirstChild("NotificationFrame")
+	notificationText    = notificationFrame and notificationFrame:FindFirstChild("NotificationText")
+
+	playerFrame = nil
+	local screenGui = playerGui:FindFirstChild("ScreenGui")
+	if screenGui then
+		playerFrame = screenGui:FindFirstChild("Player")
+	end
+
+	mainFrame.Visible = false
+	if notificationFrame then notificationFrame.Visible = false end
+
+	-- Configurar módulos con referencias
+	Typewriter.SetSpeakerIndicator(speakerIndicator)
+	ChoiceBuilder.SetChoicesFrame(choicesFrame)
+
+	return true
+end
+
+-- ========================
+-- NAVEGAR A UN NODO
+-- ========================
+local function navigateToNode(nodeId)
+	if not currentNpcConfig then return end
+	local tree = currentNpcConfig.dialogueTree
+	if not tree then return end
+
+	local node = tree[nodeId]
+	if not node then
+		warn("[NPCDialogueController] Nodo no encontrado: " .. tostring(nodeId))
+		return
+	end
+
+	currentNodeId = nodeId
+
+	if dialogueTextLabel then
+		local accentColor = Theme.GetAccentColor(nodeId)
+		Typewriter.Play(dialogueTextLabel, node.npcText or "...", function()
+			ChoiceBuilder.Clear()
+			if node.choices then
+				for i, choice in ipairs(node.choices) do
+					local btn = ChoiceBuilder.CreateButton(choice.text, i, #node.choices, accentColor)
+
+					btn.MouseButton1Click:Connect(function()
+						if choice.action then
+							if choice.action == "close" then
+								closeDialogue()
+							elseif choice.action == "accept_mission" then
+								if currentNpcId then
+									RemoteUtil.FireServer(Config.Remotes.NPCDialogue.AcceptNPCMission, currentNpcId)
+								end
+							elseif choice.action == "complete_mission" then
+								if currentNpcId then
+									RemoteUtil.FireServer(Config.Remotes.NPCDialogue.CompleteNPCMission, currentNpcId)
+								end
+							end
+						elseif choice.next then
+							ChoiceBuilder.Clear()
+							navigateToNode(choice.next)
+						end
+					end)
+				end
+			end
+		end)
+	end
+end
+
+-- ========================
+-- BUSCAR MODELO NPC EN WORKSPACE
+-- ========================
+local function findNpcModel(npcId)
+	local npcsFolder = workspace:FindFirstChild("NPCs")
+	if not npcsFolder then return nil end
+	for _, npcModel in npcsFolder:GetChildren() do
+		if npcModel:IsA("Model") then
+			local npcIdAttr = npcModel:GetAttribute("NPCId")
+			if npcIdAttr and string.lower(npcIdAttr) == string.lower(npcId) then
+				return npcModel
+			end
+			if string.lower(npcModel.Name) == string.lower(npcId) then
+				return npcModel
+			end
+		end
+	end
+	return nil
+end
+
+-- ========================
+-- INICIAR CHEQUEO DE DISTANCIA
+-- ========================
+local function startDistanceCheck()
+	if distanceCheckConn then return end  -- ya está corriendo
+
+	distanceCheckConn = task.spawn(function()
+		while isDialogueOpen do
+			local char = LocalPlayer.Character
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+			if hrp and currentNpcModel then
+				local npcHrp = currentNpcModel:FindFirstChild("HumanoidRootPart")
+				if npcHrp then
+					local dist = (hrp.Position - npcHrp.Position).Magnitude
+					if dist > MAX_DIALOGUE_DIST then
+						closeDialogue()
+						break
+					end
+				end
+			elseif hrp and not currentNpcModel then
+				-- Si no tenemos referencia al modelo, intentar buscarlo de nuevo
+				if currentNpcId then
+					currentNpcModel = findNpcModel(currentNpcId)
+				end
+			end
+
+			task.wait(0.3)
+		end
+		distanceCheckConn = nil
+	end)
+end
+
+-- ========================
+-- ABRIR DIÁLOGO
+-- ========================
+local function openDialogue(dialogueState)
+	if not mainFrame then return end
+
+	local npcId = dialogueState.npcId
+	currentNpcId = npcId
+	currentNpcConfig = getNPCConfig(npcId)
+
+	if not currentNpcConfig then
+		warn("[NPCDialogueController] Config de NPC no encontrada: " .. tostring(npcId))
+		return
+	end
+
+	-- Guardar referencia al modelo NPC en workspace para chequeo de distancia
+	-- Prioridad: modelo guardado al activar prompt > búsqueda por nombre
+	currentNpcModel = pendingNpcModel or findNpcModel(npcId)
+	pendingNpcModel = nil
+
+	isDialogueOpen = true
+
+	-- Ocultar frame Player mientras el diálogo está abierto
+	if playerFrame then playerFrame.Visible = false end
+
+	if npcNameLabel then
+		npcNameLabel.Text = dialogueState.npcName or currentNpcConfig.name or "???"
+	end
+
+	if npcTitleLabel then
+		npcTitleLabel.Text = dialogueState.npcTitle or currentNpcConfig.title or ""
+	end
+
+	ViewportHelper.CreateModel(npcViewport, currentNpcConfig)
+	Animations.StartPortraitPulse()
+
+	local startNode = dialogueState.missionStatus or "available"
+	if not currentNpcConfig.dialogueTree[startNode] then
+		startNode = "available"
+	end
+
+	Animations.OpenDialogue(mainFrame, dialogueGui, function()
+		navigateToNode(startNode)
+	end)
+
+	-- Iniciar chequeo de distancia
+	startDistanceCheck()
+end
+
+-- ========================
+-- CERRAR DIÁLOGO
+-- ========================
+closeDialogue = function()
+	if not mainFrame or not isDialogueOpen then return end
+
+	isDialogueOpen = false
+	Typewriter.Stop()
+	Animations.StopPortraitPulse()
+
+	-- Detener chequeo de distancia
+	distanceCheckConn = nil
+
+	-- Mostrar frame Player al cerrar diálogo
+	if playerFrame then playerFrame.Visible = true end
+
+	Animations.CloseDialogue(mainFrame, dialogueGui, function()
+		ChoiceBuilder.Clear()
+		currentNpcId = nil
+		currentNpcConfig = nil
+		currentNodeId = nil
+		currentNpcModel = nil
+		ViewportHelper.Clear()
+	end)
+end
+
+-- ========================
+-- NOTIFICACIÓN
+-- ========================
+local function showNotification(data)
+	Animations.ShowNotification(notificationFrame, notificationText, data)
+end
+
+-- ========================
+-- CONECTAR PROMPTS DE NPCs
+-- ========================
+local function connectNPCPrompts()
+	local npcsFolder = workspace:FindFirstChild("NPCs")
+	if not npcsFolder then return end
+
+	local function onPromptTriggered(prompt)
+		local hrp = prompt.Parent
+		if not hrp then return end
+		local npcModel = hrp.Parent
+		if not npcModel then return end
+		local npcId = string.lower(npcModel.Name)
+		currentNpcId = npcId
+		-- Guardar referencia al modelo NPC para el chequeo de distancia
+		pendingNpcModel = npcModel
+		RemoteUtil.FireServer(Config.Remotes.NPCDialogue.NPCInteract, npcId)
+	end
+
+	local function setupPrompt(prompt)
+		if prompt:IsA("ProximityPrompt") then
+			prompt.Triggered:Connect(function()
+				onPromptTriggered(prompt)
+			end)
+		end
+	end
+
+	for _, npcModel in npcsFolder:GetChildren() do
+		if npcModel:IsA("Model") then
+			local hrp = npcModel:FindFirstChild("HumanoidRootPart")
+			if hrp then
+				local prompt = hrp:FindFirstChild("TalkPrompt")
+				if prompt then setupPrompt(prompt) end
+			end
+		end
+	end
+
+	npcsFolder.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("ProximityPrompt") and descendant.Name == "TalkPrompt" then
+			setupPrompt(descendant)
+		end
+	end)
+end
+
+-- ========================
+-- CONECTAR BOTONES DE GUI
+-- ========================
+local function connectGUIButtons()
+	if dialogueFrame then
+		dialogueFrame.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				if Typewriter.IsTypewriting() then
+					Typewriter.Skip(dialogueTextLabel)
+				end
+			end
+		end)
+	end
+end
+
+-- ========================
+-- ESCUCHAR EVENTOS DEL SERVIDOR
+-- ========================
+local function connectServerEvents()
+	RemoteUtil.OnClientEvent(Config.Remotes.NPCDialogue.NPCDialogueResponse, function(dialogueState)
+		if dialogueState then openDialogue(dialogueState) end
+	end)
+
+	RemoteUtil.OnClientEvent(Config.Remotes.NPCDialogue.AcceptNPCMission, function(success, result)
+		if success then
+			closeDialogue()
+			if type(result) == "table" and result.message then
+				showNotification({ message = result.message })
+			end
+		else
+			if type(result) == "string" then
+				showNotification({ message = "❌ " .. result })
+			end
+		end
+	end)
+
+	RemoteUtil.OnClientEvent(Config.Remotes.NPCDialogue.CompleteNPCMission, function(success, result)
+		if success then
+			closeDialogue()
+			if type(result) == "table" and result.message then
+				showNotification({ message = result.message })
+			end
+		else
+			if type(result) == "string" then
+				showNotification({ message = "❌ " .. result })
+			end
+		end
+	end)
+
+	RemoteUtil.OnClientEvent(Config.Remotes.NPCDialogue.NPCMissionUpdate, function(npcId, status, progress)
+		if isDialogueOpen and currentNpcId == npcId then
+			RemoteUtil.FireServer(Config.Remotes.NPCDialogue.NPCInteract, npcId)
+		end
+		if status == "completable" then
+			showNotification({ message = "✅ ¡Misión lista para entregar! Vuelve al NPC." })
+		end
+	end)
+
+	RemoteUtil.OnClientEvent(Config.Remotes.NPCDialogue.NPCRewardNotification, function(data)
+		if data and data.message then showNotification(data) end
+	end)
+end
+
+-- ========================
+-- INICIALIZACIÓN
+-- ========================
+function NPCDialogueController:Init()
+	print("[NPCDialogueController] Inicializando (modo modular)...")
+
+	-- Configurar módulos con constantes de animación
+	Typewriter.Configure(Theme.Animation)
+	ChoiceBuilder.Configure(Theme.Animation)
+
+	task.spawn(function()
+		local success = false
+		for attempt = 1, 10 do
+			success = setupGUIReferences()
+			if success then break end
+			task.wait(1)
+		end
+
+		if not success then
+			warn("[NPCDialogueController] No se pudo encontrar DialogueGui")
+			return
+		end
+
+		connectGUIButtons()
+		connectServerEvents()
+		connectNPCPrompts()
+
+		print("[NPCDialogueController] Inicializado ✓ (Visual Novel Mode - Modular)")
+	end)
+end
+
+return NPCDialogueController
